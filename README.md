@@ -182,7 +182,7 @@ you trust three strangers to disagree with each other when it matters.
 ## Related repos
 
 - [`dobbscoin/wbob-bridge`](https://github.com/dobbscoin/wbob-bridge) — the bridge service stack (backend, watcher, portal, ops)
-- [`dobbscoin/dobbscoin-source`](https://github.com/dobbscoin/dobbscoin-source) — the Dobbscoin L1 daemon (Bitcoin Core 0.10 fork, scrypt PoW, since Jan 2014)
+- [`SubGeniusFinance/dobbscoin-source`](https://github.com/SubGeniusFinance/dobbscoin-source) — the Dobbscoin L1 daemon (Bitcoin Core 0.10 fork, scrypt PoW, since Jan 2014)
 
 ---
 
