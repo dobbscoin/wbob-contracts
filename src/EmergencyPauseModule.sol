@@ -43,6 +43,13 @@ contract EmergencyPauseModule {
     error OnlySafe();
     error ZeroAddress();
     error NothingPaused();
+    error NotEnoughGas(uint256 left, uint256 needed);
+
+    /// @dev Checked before EACH target. Without it, an eth_estimateGas'd tx can land
+    ///      in a band where the controller pause succeeds and the token's inner call
+    ///      runs out of gas (the Safe returns false, we catch it), so the tx succeeds
+    ///      with the token still live. 63/64 of this is ample for a pause() call.
+    uint256 public constant MIN_GAS_PER_TARGET = 150_000;
 
     constructor(ISafe safe_, address controller_, address token_, address operator_) {
         if (address(safe_) == address(0) || controller_ == address(0) || token_ == address(0) || operator_ == address(0)) {
@@ -73,6 +80,7 @@ contract EmergencyPauseModule {
     /// @return isPaused whether the target is paused after this call
     function _pauseIfNeeded(address target) internal returns (bool isPaused) {
         if (IPausableTarget(target).paused()) return true;
+        if (gasleft() < MIN_GAS_PER_TARGET) revert NotEnoughGas(gasleft(), MIN_GAS_PER_TARGET);
         bool ok;
         try safe.execTransactionFromModule(target, 0, abi.encodeWithSignature("pause()"), 0) returns (bool r) {
             ok = r;

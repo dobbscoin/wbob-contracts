@@ -33,11 +33,18 @@ import "./WBob.sol";
  *     per-user nonces from 0, so a fresh controller would otherwise re-issue ids
  *     the backend has already recorded (and would skip as duplicates).
  *   - unpause requires DEFAULT_ADMIN_ROLE (the Safe); PAUSER_ROLE can only pause.
+ *   - Refund accounting ON-CHAIN (2026-11 review round 3): watchers sign the
+ *     deposit output's full value (sourceValue, read from their own node), and
+ *     the backend records every refund here (REFUND_MARKER_ROLE) BEFORE sending
+ *     it. Per output: minted + refunded <= value. A DB writer can no longer mint
+ *     against a refunded deposit, or mint more than the part not refunded.
+ *     Recording a refund can only BLOCK mints, so the marker key is low-risk.
+ *   - The Dobbscoin chain id is pinned (SOURCE_CHAIN_ID): outpoint uniqueness
+ *     no longer rests on every watcher's DOBBSCOIN_NETWORK setting.
  *
- * Unchanged on purpose: the MintAuthorization struct and its typehash (watchers
- * keep their signing code; only the domain changes), the MintExecuted and
- * WithdrawalRequested event signatures (the backend keeps its parsers), and
- * THRESHOLD = 3.
+ * Unchanged on purpose: the MintExecuted and WithdrawalRequested event
+ * signatures (the backend keeps its parsers), and THRESHOLD = 3. The
+ * MintAuthorization struct gains sourceValue (so its typehash differs from V1).
  *
  * Roles: DEFAULT_ADMIN_ROLE → Safe. PAUSER_ROLE → Safe (an emergency module
  * pauses through the Safe).
@@ -46,6 +53,8 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     // ─── Constants ───────────────────────────────────────────────────────────
 
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    /// @notice May only RECORD refunds (which can only block mints). Granted to the backend relayer.
+    bytes32 public constant REFUND_MARKER_ROLE = keccak256("REFUND_MARKER_ROLE");
 
     uint8 public constant MAX_SIGNERS = 7;
     uint8 public constant THRESHOLD = 3;
@@ -58,12 +67,15 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     bytes32 public constant MINT_AUTHORIZATION_TYPEHASH = keccak256(
         "MintAuthorization(bytes32 depositId,address recipient,uint256 amount,"
         "uint256 sourceChainId,bytes32 sourceTxHash,uint32 sourceVout,"
-        "uint256 deadline,uint256 nonce)"
+        "uint256 sourceValue,uint256 deadline,uint256 nonce)"
     );
 
     // ─── State ───────────────────────────────────────────────────────────────
 
     WBob public immutable wBOB;
+
+    /// @notice The only Dobbscoin chain id this controller mints for.
+    uint256 public immutable SOURCE_CHAIN_ID;
 
     mapping(address => bool) public isSigner;
     uint8 public signerCount;
@@ -76,6 +88,11 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
 
     /// @notice keccak256(abi.encode(sourceChainId, sourceTxHash, sourceVout)) → minted.
     mapping(bytes32 => bool) public processedOutpoints;
+
+    /// @notice Per output: full value (set by the first mint or refund record), minted, refunded.
+    mapping(bytes32 => uint256) public outpointValue;
+    mapping(bytes32 => uint256) public mintedAmount;
+    mapping(bytes32 => uint256) public refundedAmount;
 
     /// @notice True once V1's minted outpoints are imported. No mint before the seal.
     bool public importSealed;
@@ -117,6 +134,7 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     event ImportSealed();
     event MintLimitPerWindowUpdated(uint256 oldLimit, uint256 newLimit);
     event MinWithdrawalUpdated(uint256 oldMin, uint256 newMin);
+    event RefundRecorded(bytes32 indexed outpointKey, uint256 value, uint256 refundedTotal);
 
     // ─── Errors ──────────────────────────────────────────────────────────────
 
@@ -136,6 +154,9 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     error ZeroAmount();
     error WithdrawalTooSmall(uint256 amount, uint256 minimum);
     error InvalidDobbscoinAddress();
+    error WrongSourceChain(uint256 provided, uint256 expected);
+    error SourceValueMismatch(bytes32 outpointKey, uint256 provided, uint256 recorded);
+    error ExceedsSourceValue(bytes32 outpointKey, uint256 minted, uint256 refunded, uint256 value);
 
     // ─── MintAuthorization (identical to V1) ─────────────────────────────────
 
@@ -146,6 +167,7 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
         uint256 sourceChainId;
         bytes32 sourceTxHash;
         uint32 sourceVout;
+        uint256 sourceValue;   // full value of the deposit output (8 decimals), per the signers' nodes
         uint256 deadline;
         uint256 nonce;
     }
@@ -157,9 +179,12 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
         address admin_,
         address[] memory signers_,
         uint256 mintLimitPerWindow_,
-        uint256 minWithdrawal_
+        uint256 minWithdrawal_,
+        uint256 sourceChainId_
     ) EIP712("BridgeController", "2") {
         if (wBOB_ == address(0) || admin_ == address(0)) revert ZeroAddress();
+        if (sourceChainId_ == 0) revert WrongSourceChain(0, 1);
+        SOURCE_CHAIN_ID = sourceChainId_;
         if (signers_.length > MAX_SIGNERS) revert SignerSetFull();
         if (signers_.length < THRESHOLD) revert BelowThreshold();
 
@@ -193,9 +218,15 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
         if (!importSealed) revert ImportNotSealed();
         if (auth.amount == 0) revert ZeroAmount();
         if (auth.recipient == address(0)) revert ZeroAddress();
+        if (auth.sourceChainId != SOURCE_CHAIN_ID) revert WrongSourceChain(auth.sourceChainId, SOURCE_CHAIN_ID);
         if (processedDeposits[auth.depositId]) revert AlreadyProcessed(auth.depositId);
         bytes32 opKey = outpointKey(auth.sourceChainId, auth.sourceTxHash, auth.sourceVout);
         if (processedOutpoints[opKey]) revert OutpointAlreadyMinted(opKey);
+        _checkAndSetValue(opKey, auth.sourceValue);
+        uint256 refunded = refundedAmount[opKey];
+        if (auth.amount + refunded > auth.sourceValue) {
+            revert ExceedsSourceValue(opKey, auth.amount, refunded, auth.sourceValue);
+        }
         if (block.timestamp > auth.deadline) revert DeadlineExpired(auth.deadline, block.timestamp);
         if (auth.nonce != mintNonce) revert WrongMintNonce(auth.nonce, mintNonce);
 
@@ -205,6 +236,7 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
         _consumeWindow(auth.amount);
         processedDeposits[auth.depositId] = true;
         processedOutpoints[opKey] = true;
+        mintedAmount[opKey] = auth.amount;
 
         wBOB.mint(auth.recipient, auth.amount);
 
@@ -233,6 +265,27 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
 
         uint256 withdrawalId = uint256(keccak256(abi.encodePacked(address(this), msg.sender, nonce)));
         emit WithdrawalRequested(withdrawalId, msg.sender, amount, dobbscoinAddress, nonce);
+    }
+
+    // ─── Refund accounting ───────────────────────────────────────────────────
+
+    /**
+     * @notice Record that `refundedTotal` of output (txHash, vout), worth `value`,
+     *         is refunded on Dobbscoin. The backend calls this BEFORE broadcasting
+     *         a refund. Monotonic and idempotent: sets the total, never lowers it.
+     *         Can only BLOCK mints: minted + refunded <= value always holds.
+     */
+    function recordRefund(bytes32 sourceTxHash, uint32 sourceVout, uint256 value, uint256 refundedTotal)
+        external
+        onlyRole(REFUND_MARKER_ROLE)
+    {
+        bytes32 opKey = outpointKey(SOURCE_CHAIN_ID, sourceTxHash, sourceVout);
+        _checkAndSetValue(opKey, value);
+        if (refundedTotal <= refundedAmount[opKey]) return;     // already recorded (retry)
+        uint256 minted = mintedAmount[opKey];
+        if (minted + refundedTotal > value) revert ExceedsSourceValue(opKey, minted, refundedTotal, value);
+        refundedAmount[opKey] = refundedTotal;
+        emit RefundRecorded(opKey, value, refundedTotal);
     }
 
     // ─── One-time migration import ───────────────────────────────────────────
@@ -349,8 +402,16 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
             MINT_AUTHORIZATION_TYPEHASH,
             auth.depositId, auth.recipient, auth.amount,
             auth.sourceChainId, auth.sourceTxHash, auth.sourceVout,
-            auth.deadline, auth.nonce
+            auth.sourceValue, auth.deadline, auth.nonce
         )));
+    }
+
+    /// @dev First record of an output fixes its value; every later mint/refund must agree.
+    function _checkAndSetValue(bytes32 opKey, uint256 value) internal {
+        if (value == 0) revert ZeroAmount();
+        uint256 recorded = outpointValue[opKey];
+        if (recorded == 0) outpointValue[opKey] = value;
+        else if (recorded != value) revert SourceValueMismatch(opKey, value, recorded);
     }
 
     function _consumeWindow(uint256 amount) internal {

@@ -29,14 +29,14 @@ contract BridgeControllerV2Test is Test {
             keys[i] = uint256(keccak256(abi.encode("signer", i)));
             signers.push(vm.addr(keys[i]));
         }
-        bc = new BridgeControllerV2(address(token), admin, signers, LIMIT, MIN_W);
+        bc = new BridgeControllerV2(address(token), admin, signers, LIMIT, MIN_W, CHAIN);
         token.grantRole(token.BRIDGE_EXECUTOR_ROLE(), address(bc));
         bc.grantRole(bc.PAUSER_ROLE(), pauserOnly);
         bc.unpause();                                 // the Safe's LAST cutover step
     }
 
     function test_bornPaused() public {
-        BridgeControllerV2 fresh = new BridgeControllerV2(address(token), admin, signers, LIMIT, MIN_W);
+        BridgeControllerV2 fresh = new BridgeControllerV2(address(token), admin, signers, LIMIT, MIN_W, CHAIN);
         assertTrue(fresh.paused());
     }
 
@@ -45,9 +45,16 @@ contract BridgeControllerV2Test is Test {
     function _auth(bytes32 depositId, address to, uint256 amount, bytes32 txh, uint32 vout)
         internal view returns (BridgeControllerV2.MintAuthorization memory a)
     {
+        a = _authV(depositId, to, amount, txh, vout, amount);   // whole output minted
+    }
+
+    function _authV(bytes32 depositId, address to, uint256 amount, bytes32 txh, uint32 vout, uint256 value)
+        internal view returns (BridgeControllerV2.MintAuthorization memory a)
+    {
         a = BridgeControllerV2.MintAuthorization({
             depositId: depositId, recipient: to, amount: amount, sourceChainId: CHAIN,
-            sourceTxHash: txh, sourceVout: vout, deadline: block.timestamp + 1 hours, nonce: bc.mintNonce()
+            sourceTxHash: txh, sourceVout: vout, sourceValue: value,
+            deadline: block.timestamp + 1 hours, nonce: bc.mintNonce()
         });
     }
 
@@ -195,7 +202,7 @@ contract BridgeControllerV2Test is Test {
             keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
             keccak256("BridgeController"), keccak256("2"), block.chainid, address(bc)));
         bytes32 structHash = keccak256(abi.encode(bc.MINT_AUTHORIZATION_TYPEHASH(),
-            a.depositId, a.recipient, a.amount, a.sourceChainId, a.sourceTxHash, a.sourceVout, a.deadline, a.nonce));
+            a.depositId, a.recipient, a.amount, a.sourceChainId, a.sourceTxHash, a.sourceVout, a.sourceValue, a.deadline, a.nonce));
         assertEq(bc.getMintAuthorizationDigest(a), keccak256(abi.encodePacked("\x19\x01", domain, structHash)));
     }
 
@@ -349,5 +356,98 @@ contract BridgeControllerV2Test is Test {
         bc.addSigner(makeAddr("s7"));
         vm.expectRevert(BridgeControllerV2.SignerSetFull.selector);
         bc.addSigner(makeAddr("s8"));
+    }
+
+    // ─── Refund accounting (review round 3) ──────────────────────────────────
+
+    address marker = makeAddr("marker");
+
+    function _grantMarker() internal { bc.grantRole(bc.REFUND_MARKER_ROLE(), marker); }
+
+    function _mintV(bytes32 depositId, uint256 amount, bytes32 txh, uint32 vout, uint256 value) internal {
+        BridgeControllerV2.MintAuthorization memory a = _authV(depositId, recipient, amount, txh, vout, value);
+        bc.executeMint(a, _sigs(a));
+    }
+
+    function test_fullyRefundedOutputCanNeverMint() public {
+        _seal(); _grantMarker();
+        vm.prank(marker);
+        bc.recordRefund("rtx", 0, 5e8, 5e8);                 // whole deposit refunded
+        // A DB writer forges a mint for it: watchers would sign (output is real), the contract refuses.
+        BridgeControllerV2.MintAuthorization memory a = _authV("forged", user, 1, "rtx", 0, 5e8);
+        bytes[] memory s = _sigs(a);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.ExceedsSourceValue.selector,
+            bc.outpointKey(CHAIN, "rtx", 0), 1, 5e8, 5e8));
+        bc.executeMint(a, s);
+    }
+
+    function test_splitDeposit_mintCappedAtValueMinusRefund() public {
+        _seal(); _grantMarker();
+        vm.prank(marker);
+        bc.recordRefund("stx", 0, 10e8, 4e8);                // 4 of 10 refunded over the cap
+        BridgeControllerV2.MintAuthorization memory a = _authV("inflated", recipient, 10e8, "stx", 0, 10e8);
+        bytes[] memory s = _sigs(a);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.ExceedsSourceValue.selector,
+            bc.outpointKey(CHAIN, "stx", 0), 10e8, 4e8, 10e8));
+        bc.executeMint(a, s);                                // DB raised the mint to the full deposit
+        _mintV("honest", 6e8, "stx", 0, 10e8);               // the honest split mints
+        assertEq(token.balanceOf(recipient), 6e8);
+    }
+
+    function test_refundAfterMintCannotExceedRemainder() public {
+        _seal(); _grantMarker();
+        _mintV("m", 6e8, "ptx", 0, 10e8);
+        bytes32 k = bc.outpointKey(CHAIN, "ptx", 0);         // computed BEFORE the prank (an external call consumes it)
+        vm.prank(marker);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.ExceedsSourceValue.selector, k, 6e8, 5e8, 10e8));
+        bc.recordRefund("ptx", 0, 10e8, 5e8);
+        vm.prank(marker);
+        bc.recordRefund("ptx", 0, 10e8, 4e8);
+        assertEq(bc.refundedAmount(bc.outpointKey(CHAIN, "ptx", 0)), 4e8);
+    }
+
+    function test_recordRefundIsIdempotentAndMonotonic() public {
+        _grantMarker();
+        vm.startPrank(marker);
+        bc.recordRefund("itx", 0, 10e8, 4e8);
+        bc.recordRefund("itx", 0, 10e8, 4e8);                // retry: no-op
+        bc.recordRefund("itx", 0, 10e8, 2e8);                // lower: ignored, never decreases
+        vm.stopPrank();
+        assertEq(bc.refundedAmount(bc.outpointKey(CHAIN, "itx", 0)), 4e8);
+    }
+
+    function test_onlyMarkerRecordsRefunds() public {
+        vm.prank(user);
+        vm.expectRevert();
+        bc.recordRefund("x", 0, 1e8, 1e8);
+    }
+
+    function test_valueMismatchBlocks() public {
+        _seal(); _grantMarker();
+        vm.prank(marker);
+        bc.recordRefund("vtx", 0, 10e8, 1e8);
+        BridgeControllerV2.MintAuthorization memory a = _authV("v", recipient, 1e8, "vtx", 0, 99e8);
+        bytes[] memory s = _sigs(a);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.SourceValueMismatch.selector,
+            bc.outpointKey(CHAIN, "vtx", 0), 99e8, 10e8));
+        bc.executeMint(a, s);
+    }
+
+    function test_wrongSourceChainRejected() public {
+        _seal();
+        BridgeControllerV2.MintAuthorization memory a = _auth("c", recipient, 1e8, "ctx", 0);
+        a.sourceChainId = CHAIN + 1;
+        bytes[] memory s = _sigs(a);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.WrongSourceChain.selector, CHAIN + 1, CHAIN));
+        bc.executeMint(a, s);
+    }
+
+    function test_amountAboveSignedValueRejected() public {
+        _seal();
+        BridgeControllerV2.MintAuthorization memory a = _authV("over", recipient, 2e8, "otx", 0, 1e8);
+        bytes[] memory s = _sigs(a);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.ExceedsSourceValue.selector,
+            bc.outpointKey(CHAIN, "otx", 0), 2e8, 0, 1e8));
+        bc.executeMint(a, s);
     }
 }

@@ -34,7 +34,7 @@ contract EmergencyPauseModuleTest is Test {
         token = new WBob(address(safe), address(safe), 0, type(uint128).max);
         address[] memory s = new address[](3);
         s[0] = makeAddr("a"); s[1] = makeAddr("b"); s[2] = makeAddr("c");
-        bc = new BridgeControllerV2(address(token), address(safe), s, 250_000e8, 100_000);
+        bc = new BridgeControllerV2(address(token), address(safe), s, 250_000e8, 100_000, 1000001);
         mod = new EmergencyPauseModule(ISafe(address(safe)), address(bc), address(token), operator);
         safe.enableModule(address(mod));
     }
@@ -107,5 +107,26 @@ contract EmergencyPauseModuleTest is Test {
         rogue.pauseAll();
         assertFalse(bc.paused());
         assertFalse(token.paused());
+    }
+
+    /// Review round 3: with too little gas the module must REVERT, never pause just the controller.
+    function test_lowGasRevertsInsteadOfHalfPausing() public {
+        safe.exec(address(bc), abi.encodeWithSignature("unpause()"));
+        vm.prank(operator);
+        (bool ok, ) = address(mod).call{gas: 200_000}(abi.encodeWithSignature("pauseAll()"));
+        if (ok) {
+            assertTrue(bc.paused() && token.paused(), "succeeded: both must be paused");
+        } else {
+            assertFalse(bc.paused(), "reverted: nothing may stay paused");
+            assertFalse(token.paused());
+        }
+        // Sweep gas limits: there must be NO limit where exactly one target ends up paused.
+        for (uint256 g = 60_000; g < 400_000; g += 2_500) {
+            uint256 snap = vm.snapshotState();
+            vm.prank(operator);
+            address(mod).call{gas: g}(abi.encodeWithSignature("pauseAll()"));
+            assertEq(bc.paused(), token.paused(), "half-paused at some gas limit");
+            vm.revertToState(snap);
+        }
     }
 }

@@ -47,6 +47,7 @@ contract ForkCutoverTest is Test {
     EmergencyPauseModule mod;
     uint256[3] keys;
     address operator = makeAddr("operator");
+    address constant RELAYER = 0x032FaEe270fc9DDE30F721Ebbf739935De82F4a5;   // live executor/relayer
     address recipient = makeAddr("recipient");
     bool forked;
     uint256 v1NonceBefore;
@@ -62,7 +63,7 @@ contract ForkCutoverTest is Test {
             keys[i] = uint256(keccak256(abi.encode("fork-signer", i)));
             signers[i] = vm.addr(keys[i]);
         }
-        bc = new BridgeControllerV2(address(WBOB), SAFE, signers, 250_000e8, 100_000);
+        bc = new BridgeControllerV2(address(WBOB), SAFE, signers, 250_000e8, 100_000, CHAIN);
         mod = new EmergencyPauseModule(ISafe(SAFE), address(bc), address(WBOB), operator);
 
         v1NonceBefore = IBridgeV1(V1).mintNonce();
@@ -78,6 +79,7 @@ contract ForkCutoverTest is Test {
         k[0] = bc.outpointKey(CHAIN, REAL_TXH, REAL_VOUT);
         bc.importProcessedOutpoints(k);
         bc.sealImport();
+        bc.grantRole(bc.REFUND_MARKER_ROLE(), RELAYER);   // backend records refunds before sending them
         ISafeFull(SAFE).enableModule(address(mod));
         // New module is at the head of the list, so the old one's predecessor is it.
         ISafeFull(SAFE).disableModule(address(mod), OLD_MODULE);
@@ -96,7 +98,7 @@ contract ForkCutoverTest is Test {
     function _auth(bytes32 depositId, uint256 amount, bytes32 txh, uint32 vout)
         internal view returns (BridgeControllerV2.MintAuthorization memory a)
     {
-        a = BridgeControllerV2.MintAuthorization(depositId, recipient, amount, CHAIN, txh, vout, block.timestamp + 1 hours, 0);
+        a = BridgeControllerV2.MintAuthorization(depositId, recipient, amount, CHAIN, txh, vout, amount, block.timestamp + 1 hours, 0);
     }
 
     function _sigs(BridgeControllerV2.MintAuthorization memory a) internal view returns (bytes[] memory s) {
@@ -169,6 +171,19 @@ contract ForkCutoverTest is Test {
         vm.stopPrank();
         vm.prank(recipient);
         WBOB.transfer(makeAddr("dex"), 1e8);
+    }
+
+    function test_fork_relayerCanOnlyRecordRefunds() public onlyFork {
+        vm.prank(RELAYER);
+        bc.recordRefund(keccak256("fork-refund-tx"), 0, 5e8, 5e8);
+        BridgeControllerV2.MintAuthorization memory a = _auth("fork-forged", 1e8, keccak256("fork-refund-tx"), 0);
+        a.sourceValue = 5e8;
+        bytes[] memory s = _sigs(a);
+        vm.expectRevert();                                   // refunded in full: can never mint
+        bc.executeMint(a, s);
+        vm.prank(RELAYER);
+        vm.expectRevert();                                   // and the relayer can't unpause or admin anything
+        bc.unpause();
     }
 
     function test_fork_tokenDailyCapStillApplies() public onlyFork {
