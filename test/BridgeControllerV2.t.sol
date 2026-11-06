@@ -475,16 +475,16 @@ contract BridgeControllerV2Test is Test {
         vm.prank(marker);
         bc.recordRefund("poison", 0, 1, 1);                   // stolen marker: wrong value + full refund
         bytes32 k = bc.outpointKey(CHAIN, "poison", 0);
-        bc.resetOutpointRecord(k);                            // Safe clears it
+        bc.resetOutpointRecord(k, 0, 0);                      // Safe clears it
         assertEq(bc.outpointValue(k), 0);
         assertEq(bc.refundedAmount(k), 0);
         _mintV("honest", 5e8, "poison", 0, 5e8);              // the real deposit can mint again
         vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.OutpointAlreadyProcessed.selector, k));
-        bc.resetOutpointRecord(k);                            // never for a minted output
+        bc.resetOutpointRecord(k, 0, 0);                      // never for a minted output
         bytes32 other = bc.outpointKey(CHAIN, "other", 0);    // before the prank (external call consumes it)
         vm.prank(user);
         vm.expectRevert();
-        bc.resetOutpointRecord(other);                        // admin only
+        bc.resetOutpointRecord(other, 0, 0);                  // admin only
     }
 
     function test_valueSetIsLogged() public {
@@ -493,5 +493,28 @@ contract BridgeControllerV2Test is Test {
         emit BridgeControllerV2.OutpointValueSet(bc.outpointKey(CHAIN, "ev", 0), 7e8);
         vm.prank(marker);
         bc.recordRefund("ev", 0, 7e8, 1e8);
+    }
+
+    // ─── Review round 5 ──────────────────────────────────────────────────────
+
+    function test_resetKeepsARealRefund_soItCanNeverBeMinted() public {
+        _seal(); _grantMarker();
+        vm.prank(marker);
+        bc.recordRefund("half", 0, 1, 1);                     // poisoned: wrong value 1
+        bytes32 k = bc.outpointKey(CHAIN, "half", 0);
+        bc.resetOutpointRecord(k, 10e8, 4e8);                 // truth: 10 BOB output, 4 BOB really refunded
+        assertEq(bc.outpointValue(k), 10e8);
+        assertEq(bc.refundedAmount(k), 4e8);
+        BridgeControllerV2.MintAuthorization memory a = _authV("over", recipient, 7e8, "half", 0, 10e8);
+        bytes[] memory sg = _sigs(a);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.ExceedsSourceValue.selector, k, 7e8, 4e8, 10e8));
+        bc.executeMint(a, sg);                                // 7 + 4 > 10
+        _mintV("honest", 6e8, "half", 0, 10e8);               // 6 + 4 = 10: ok
+    }
+
+    function test_resetRejectsRefundOverValue() public {
+        bytes32 k = bc.outpointKey(CHAIN, "x", 0);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.ExceedsSourceValue.selector, k, 0, 2e8, 1e8));
+        bc.resetOutpointRecord(k, 1e8, 2e8);
     }
 }

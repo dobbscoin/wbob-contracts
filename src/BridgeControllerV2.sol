@@ -136,7 +136,7 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     event MinWithdrawalUpdated(uint256 oldMin, uint256 newMin);
     event RefundRecorded(bytes32 indexed outpointKey, uint256 value, uint256 refundedTotal);
     event OutpointValueSet(bytes32 indexed outpointKey, uint256 value);
-    event OutpointRecordReset(bytes32 indexed outpointKey, uint256 oldValue, uint256 oldRefunded);
+    event OutpointRecordReset(bytes32 indexed outpointKey, uint256 oldValue, uint256 oldRefunded, uint256 newValue, uint256 newRefunded);
 
     // ─── Errors ──────────────────────────────────────────────────────────────
 
@@ -296,15 +296,21 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     }
 
     /**
-     * @notice Admin escape hatch for a wrongly recorded output that never minted:
-     *         clears its recorded value and refund (e.g. a stolen REFUND_MARKER key
-     *         poisoned it). Refuses for anything processed (minted here or imported).
+     * @notice Admin escape hatch for a wrongly recorded output that never minted
+     *         (e.g. a stolen REFUND_MARKER key poisoned it): sets its record to the
+     *         TRUE value and the refund REALLY paid from it (0, 0 clears it).
+     *         Setting the true refund matters: zeroing a refund that was paid
+     *         would let the same coins be minted. Refuses for anything processed
+     *         (minted here or imported).
      */
-    function resetOutpointRecord(bytes32 opKey) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function resetOutpointRecord(bytes32 opKey, uint256 trueValue, uint256 trueRefunded)
+        external onlyRole(DEFAULT_ADMIN_ROLE)
+    {
         if (processedOutpoints[opKey]) revert OutpointAlreadyProcessed(opKey);
-        emit OutpointRecordReset(opKey, outpointValue[opKey], refundedAmount[opKey]);
-        delete outpointValue[opKey];
-        delete refundedAmount[opKey];
+        if (trueRefunded > trueValue) revert ExceedsSourceValue(opKey, 0, trueRefunded, trueValue);
+        emit OutpointRecordReset(opKey, outpointValue[opKey], refundedAmount[opKey], trueValue, trueRefunded);
+        outpointValue[opKey] = trueValue;
+        refundedAmount[opKey] = trueRefunded;
     }
 
     // ─── One-time migration import ───────────────────────────────────────────
