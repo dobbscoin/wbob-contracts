@@ -19,8 +19,12 @@ import "./WBob.sol";
  *     V1's minted outpoints are imported once and then sealed; minting is
  *     disabled until the import is sealed.
  *   - Malformed / non-signer signatures are skipped (ECDSA.tryRecover), never revert.
- *   - Rolling 24-hour mint cap in 24 hourly buckets (V1/WBob use a fixed UTC day,
- *     which allows 2x the cap across midnight). The token's own cap still applies.
+ *   - Rolling mint cap over 25 hourly buckets: NO 24-hour window can exceed it
+ *     (V1/WBob use a fixed UTC day, which allows 2x the cap across midnight).
+ *     Capacity returns 24-25 h after a mint. The token's own cap still applies.
+ *   - Deployed PAUSED: nothing mints or burns until the Safe unpauses it as the
+ *     last cutover step (after V1 is paused/revoked, V1's outpoints imported and
+ *     sealed, and the backend + watchers point at V2).
  *   - Withdrawals: on-chain minimum and a basic Dobbscoin P2PKH address check
  *     (starts with '1', 26-35 base58 chars), so obviously unpayable burns revert
  *     instead of burning the user's wBOB.
@@ -45,7 +49,9 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     uint8 public constant MAX_SIGNERS = 7;
     uint8 public constant THRESHOLD = 3;
 
-    uint256 public constant WINDOW_BUCKETS = 24;
+    /// @dev 25, not 24: a real 24 h interval touches at most 25 hourly buckets, so
+    ///      checking 25 bounds EVERY 24 h window by the limit.
+    uint256 public constant WINDOW_BUCKETS = 25;
     uint256 public constant BUCKET_SECONDS = 1 hours;
 
     bytes32 public constant MINT_AUTHORIZATION_TYPEHASH = keccak256(
@@ -76,10 +82,10 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     /// @notice Per-user withdrawal nonce.
     mapping(address => uint256) public withdrawalNonces;
 
-    /// @notice Max wBOB (8 decimals) mintable through this controller in any 24 hourly buckets.
+    /// @notice Max wBOB (8 decimals) mintable through this controller in any 24 hours.
     uint256 public mintLimitPerWindow;
-    uint256[24] private _bucketAmount;
-    uint256[24] private _bucketHour;
+    uint256[25] private _bucketAmount;
+    uint256[25] private _bucketHour;
 
     /// @notice Withdrawals must be strictly greater than this (8 decimals).
     uint256 public minWithdrawal;
@@ -166,6 +172,10 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
         minWithdrawal = minWithdrawal_;
         emit MintLimitPerWindowUpdated(0, mintLimitPerWindow_);
         emit MinWithdrawalUpdated(0, minWithdrawal_);
+
+        // Born paused: withdrawals would otherwise burn as soon as the Safe grants
+        // BRIDGE_EXECUTOR_ROLE, possibly before the backend watches this address.
+        _pause();
     }
 
     // ─── Inbound ─────────────────────────────────────────────────────────────
@@ -298,7 +308,7 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
         return keccak256(abi.encode(sourceChainId, sourceTxHash, sourceVout));
     }
 
-    /// @notice Minted in the current hour plus the previous 23.
+    /// @notice Minted in the current hour plus the previous 24 (bounds every 24 h window).
     function mintedInWindow() public view returns (uint256 total) {
         uint256 nowHour = block.timestamp / BUCKET_SECONDS;
         for (uint256 i = 0; i < WINDOW_BUCKETS; i++) {

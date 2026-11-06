@@ -15,6 +15,10 @@ interface ISafeFull {
 
 interface IBridgeV1 {
     function requestWithdrawal(uint256 amount, string calldata dobbscoinAddress) external;
+    function pause() external;
+    function paused() external view returns (bool);
+    function incrementMintNonce() external;
+    function mintNonce() external view returns (uint256);
 }
 
 /**
@@ -45,6 +49,7 @@ contract ForkCutoverTest is Test {
     address operator = makeAddr("operator");
     address recipient = makeAddr("recipient");
     bool forked;
+    uint256 v1NonceBefore;
 
     function setUp() public {
         string memory rpc = vm.envOr("FORK_RPC", string(""));
@@ -60,10 +65,15 @@ contract ForkCutoverTest is Test {
         bc = new BridgeControllerV2(address(WBOB), SAFE, signers, 250_000e8, 100_000);
         mod = new EmergencyPauseModule(ISafe(SAFE), address(bc), address(WBOB), operator);
 
+        v1NonceBefore = IBridgeV1(V1).mintNonce();
         // ── The cutover, as the Safe would run it ──
         vm.startPrank(SAFE);
-        WBOB.grantRole(WBOB.BRIDGE_EXECUTOR_ROLE(), address(bc));
+        // Safe tx 1: stop V1 for good (no in-flight V1 mint can land after the key list is built).
+        IBridgeV1(V1).pause();
+        IBridgeV1(V1).incrementMintNonce();
         WBOB.revokeRole(WBOB.BRIDGE_EXECUTOR_ROLE(), V1);
+        // Safe tx 2 (after finality, key list built from ALL V1 MintExecuted through tx 1's block):
+        WBOB.grantRole(WBOB.BRIDGE_EXECUTOR_ROLE(), address(bc));
         bytes32[] memory k = new bytes32[](1);
         k[0] = bc.outpointKey(CHAIN, REAL_TXH, REAL_VOUT);
         bc.importProcessedOutpoints(k);
@@ -71,6 +81,10 @@ contract ForkCutoverTest is Test {
         ISafeFull(SAFE).enableModule(address(mod));
         // New module is at the head of the list, so the old one's predecessor is it.
         ISafeFull(SAFE).disableModule(address(mod), OLD_MODULE);
+        // (V2 is still paused here: withdrawals can't burn before the backend watches V2.)
+        assertTrue(bc.paused());
+        // Safe tx 3, LAST, after the backend + watchers point at V2:
+        bc.unpause();
         vm.stopPrank();
     }
 
@@ -92,6 +106,11 @@ contract ForkCutoverTest is Test {
             (uint8 v, bytes32 r, bytes32 ss) = vm.sign(keys[i], d);
             s[i] = abi.encodePacked(r, ss, v);
         }
+    }
+
+    function test_fork_v1PausedAndAuthorizationsInvalidated() public onlyFork {
+        assertTrue(IBridgeV1(V1).paused());
+        assertEq(IBridgeV1(V1).mintNonce(), v1NonceBefore + 1);
     }
 
     function test_fork_rolesMoved_andOldModuleGone() public onlyFork {

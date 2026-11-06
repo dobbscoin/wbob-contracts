@@ -11,7 +11,9 @@ pragma solidity ^0.8.27;
  * controller (minted wBOB stayed transferable, so it could be dumped into the
  * pools while the owners gathered signatures).
  *
- *   - pauseAll(): operator only. Pauses each target that is not already paused.
+ *   - pauseAll(): operator only. Pauses each target that is not already paused,
+ *     INDEPENDENTLY: if one target can't be paused (role lost, Safe guard), the
+ *     other still is. Reverts only if neither ends up paused.
  *   - There is NO unpause path here. Unpausing is a normal Safe transaction.
  *   - setOperator(): Safe only.
  *   - Only Operation.Call; targets are immutable.
@@ -35,11 +37,12 @@ contract EmergencyPauseModule {
 
     event OperatorChanged(address indexed oldOperator, address indexed newOperator);
     event EmergencyPaused(address indexed triggeredBy, bool controllerPaused, bool tokenPaused);
+    event PauseFailed(address indexed target);
 
     error OnlyOperator();
     error OnlySafe();
     error ZeroAddress();
-    error ModuleCallFailed(address target);
+    error NothingPaused();
 
     constructor(ISafe safe_, address controller_, address token_, address operator_) {
         if (address(safe_) == address(0) || controller_ == address(0) || token_ == address(0) || operator_ == address(0)) {
@@ -56,6 +59,7 @@ contract EmergencyPauseModule {
         if (msg.sender != operator) revert OnlyOperator();
         bool c = _pauseIfNeeded(controller);
         bool t = _pauseIfNeeded(token);
+        if (!c && !t) revert NothingPaused();
         emit EmergencyPaused(msg.sender, c, t);
     }
 
@@ -66,10 +70,16 @@ contract EmergencyPauseModule {
         operator = newOperator;
     }
 
-    function _pauseIfNeeded(address target) internal returns (bool pausedNow) {
-        if (IPausableTarget(target).paused()) return false;
-        bool ok = safe.execTransactionFromModule(target, 0, abi.encodeWithSignature("pause()"), 0);
-        if (!ok) revert ModuleCallFailed(target);
-        return true;
+    /// @return isPaused whether the target is paused after this call
+    function _pauseIfNeeded(address target) internal returns (bool isPaused) {
+        if (IPausableTarget(target).paused()) return true;
+        bool ok;
+        try safe.execTransactionFromModule(target, 0, abi.encodeWithSignature("pause()"), 0) returns (bool r) {
+            ok = r;
+        } catch {
+            ok = false;
+        }
+        if (!ok) emit PauseFailed(target);
+        return ok;
     }
 }

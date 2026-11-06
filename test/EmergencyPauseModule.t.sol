@@ -40,6 +40,7 @@ contract EmergencyPauseModuleTest is Test {
     }
 
     function test_operatorPausesControllerAndToken() public {
+        safe.exec(address(bc), abi.encodeWithSignature("unpause()"));    // live controller (born paused)
         vm.prank(operator);
         mod.pauseAll();
         assertTrue(bc.paused());
@@ -47,6 +48,7 @@ contract EmergencyPauseModuleTest is Test {
     }
 
     function test_pauseAllIsIdempotent() public {
+        safe.exec(address(bc), abi.encodeWithSignature("unpause()"));    // live controller
         safe.exec(address(token), abi.encodeWithSignature("pause()"));   // token already paused by the Safe
         vm.prank(operator);
         mod.pauseAll();
@@ -77,6 +79,18 @@ contract EmergencyPauseModuleTest is Test {
         assertFalse(token.paused());
     }
 
+    function test_pausesControllerEvenIfTokenPauseFails() public {
+        // Safe lost PAUSER on the token: the controller must still get paused.
+        safe.exec(address(token), abi.encodeWithSignature("revokeRole(bytes32,address)", token.PAUSER_ROLE(), address(safe)));
+        safe.exec(address(bc), abi.encodeWithSignature("unpause()"));
+        vm.expectEmit(true, false, false, false);
+        emit EmergencyPauseModule.PauseFailed(address(token));
+        vm.prank(operator);
+        mod.pauseAll();
+        assertTrue(bc.paused());
+        assertFalse(token.paused());
+    }
+
     function test_onlySafeRotatesOperator() public {
         vm.expectRevert(EmergencyPauseModule.OnlySafe.selector);
         mod.setOperator(makeAddr("x"));
@@ -86,9 +100,12 @@ contract EmergencyPauseModuleTest is Test {
     }
 
     function test_disabledModuleCannotPause() public {
+        safe.exec(address(bc), abi.encodeWithSignature("unpause()"));    // live controller (born paused)
         EmergencyPauseModule rogue = new EmergencyPauseModule(ISafe(address(safe)), address(bc), address(token), operator);
         vm.prank(operator);
-        vm.expectRevert();
+        vm.expectRevert(EmergencyPauseModule.NothingPaused.selector);
         rogue.pauseAll();
+        assertFalse(bc.paused());
+        assertFalse(token.paused());
     }
 }

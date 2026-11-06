@@ -32,6 +32,12 @@ contract BridgeControllerV2Test is Test {
         bc = new BridgeControllerV2(address(token), admin, signers, LIMIT, MIN_W);
         token.grantRole(token.BRIDGE_EXECUTOR_ROLE(), address(bc));
         bc.grantRole(bc.PAUSER_ROLE(), pauserOnly);
+        bc.unpause();                                 // the Safe's LAST cutover step
+    }
+
+    function test_bornPaused() public {
+        BridgeControllerV2 fresh = new BridgeControllerV2(address(token), admin, signers, LIMIT, MIN_W);
+        assertTrue(fresh.paused());
     }
 
     // ─── helpers ─────────────────────────────────────────────────────────────
@@ -203,14 +209,29 @@ contract BridgeControllerV2Test is Test {
         bc.executeMint(a, s);
     }
 
-    function test_capacityReturnsAfter24Hours() public {
+    function test_capacityReturnsAfter24to25Hours() public {
         _seal();
         _mint("d1", LIMIT, "tx1", 0);
-        vm.warp(block.timestamp + 23 hours);
-        assertEq(bc.remainingMintCapacity(), 0);
+        vm.warp(block.timestamp + 24 hours);
+        assertEq(bc.remainingMintCapacity(), 0);      // still inside the 25-bucket window
         vm.warp(block.timestamp + 1 hours);
         assertEq(bc.remainingMintCapacity(), LIMIT);
         _mint("d2", LIMIT, "tx2", 0);
+    }
+
+    /// Reviewer's worst case for 24 buckets: L at hh:59:59, L again 23h0m1s later.
+    function test_noDoubleCapWithinAny24Hours() public {
+        _seal();
+        uint256 hourEnd = (block.timestamp / 1 hours + 1) * 1 hours;
+        vm.warp(hourEnd - 1);
+        _mint("d1", LIMIT, "tx1", 0);
+        vm.warp(hourEnd - 1 + 23 hours + 1);
+        BridgeControllerV2.MintAuthorization memory a = _auth("d2", recipient, 1, "tx2", 0);
+        bytes[] memory s = _sigs(a);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.ExceedsWindowLimit.selector, 1, 0));
+        bc.executeMint(a, s);
+        vm.warp(hourEnd - 1 + 24 hours + 1);           // a full 24 h later: allowed again
+        assertEq(bc.remainingMintCapacity(), LIMIT);
     }
 
     function test_partialWindowAcrossHours() public {
@@ -219,7 +240,7 @@ contract BridgeControllerV2Test is Test {
         vm.warp(block.timestamp + 5 hours);
         _mint("d2", 150_000e8, "tx2", 0);
         assertEq(bc.remainingMintCapacity(), 0);
-        vm.warp(block.timestamp + 19 hours);         // first bucket (24 h old) drops out
+        vm.warp(block.timestamp + 20 hours);         // first bucket (25 h old) drops out
         assertEq(bc.remainingMintCapacity(), 100_000e8);
     }
 
