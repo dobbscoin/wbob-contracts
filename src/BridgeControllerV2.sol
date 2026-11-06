@@ -16,8 +16,9 @@ import "./WBob.sol";
  *   - Replay protection on the SOURCE OUTPOINT (chainId, txHash, vout), not only
  *     on the opaque depositId: one Dobbscoin output can never mint twice, even if
  *     a DB writer pairs it with a new recipient and a freshly computed depositId.
- *     V1's minted outpoints are imported once and then sealed; minting is
- *     disabled until the import is sealed.
+ *     V1's minted outpoints are imported, then sealed; minting is disabled until
+ *     the seal. Marking an outpoint can only BLOCK a mint, so the admin may keep
+ *     importing after the seal: a gap found later is never permanent.
  *   - Malformed / non-signer signatures are skipped (ECDSA.tryRecover), never revert.
  *   - Rolling mint cap over 25 hourly buckets: NO 24-hour window can exceed it
  *     (V1/WBob use a fixed UTC day, which allows 2x the cap across midnight).
@@ -76,7 +77,7 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     /// @notice keccak256(abi.encode(sourceChainId, sourceTxHash, sourceVout)) → minted.
     mapping(bytes32 => bool) public processedOutpoints;
 
-    /// @notice True once V1's minted outpoints are imported. No mint before, no import after.
+    /// @notice True once V1's minted outpoints are imported. No mint before the seal.
     bool public importSealed;
 
     /// @notice Per-user withdrawal nonce.
@@ -238,10 +239,10 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
 
     /**
      * @notice Mark outpoints V1 already minted, so they can never mint here.
-     *         Callable in batches until sealImport(). Idempotent per key.
+     *         In batches; idempotent per key. Also allowed after sealImport():
+     *         marking can only block a mint, never enable one.
      */
     function importProcessedOutpoints(bytes32[] calldata keys) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (importSealed) revert ImportAlreadySealed();
         uint256 marked;
         for (uint256 i = 0; i < keys.length; i++) {
             if (!processedOutpoints[keys[i]]) {
@@ -252,7 +253,7 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
         emit OutpointsImported(keys.length, marked);
     }
 
-    /// @notice End the import. Irreversible. Minting is enabled from here on.
+    /// @notice Enable minting (irreversible). Run the read-back check first.
     function sealImport() external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (importSealed) revert ImportAlreadySealed();
         importSealed = true;

@@ -88,11 +88,15 @@ contract BridgeControllerV2Test is Test {
         bc.executeMint(a, s);
     }
 
-    function test_importClosedAfterSeal_andSealOnce() public {
+    function test_importStillAllowedAfterSeal_blocksOnly_andSealOnce() public {
         _seal();
         bytes32[] memory k = new bytes32[](1);
-        vm.expectRevert(BridgeControllerV2.ImportAlreadySealed.selector);
-        bc.importProcessedOutpoints(k);
+        k[0] = bc.outpointKey(CHAIN, "late-found-v1tx", 0);
+        bc.importProcessedOutpoints(k);                // a gap found after the seal can still be closed
+        BridgeControllerV2.MintAuthorization memory a = _auth("x", recipient, 1e8, "late-found-v1tx", 0);
+        bytes[] memory s = _sigs(a);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.OutpointAlreadyMinted.selector, k[0]));
+        bc.executeMint(a, s);
         vm.expectRevert(BridgeControllerV2.ImportAlreadySealed.selector);
         bc.sealImport();
     }
