@@ -450,4 +450,48 @@ contract BridgeControllerV2Test is Test {
             bc.outpointKey(CHAIN, "otx", 0), 2e8, 0, 1e8));
         bc.executeMint(a, s);
     }
+
+    // ─── Review round 4 ──────────────────────────────────────────────────────
+
+    function test_importedV1OutpointCannotBeRefunded() public {
+        _grantMarker();
+        bytes32[] memory k = new bytes32[](1);
+        k[0] = bc.outpointKey(CHAIN, "v1minted", 0);
+        bc.importProcessedOutpoints(k);
+        vm.prank(marker);
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.OutpointAlreadyProcessed.selector, k[0]));
+        bc.recordRefund("v1minted", 0, 5e8, 5e8);
+    }
+
+    function test_zeroRefundRejected() public {
+        _grantMarker();
+        vm.prank(marker);
+        vm.expectRevert(BridgeControllerV2.ZeroAmount.selector);
+        bc.recordRefund("z", 0, 5e8, 0);
+    }
+
+    function test_adminCanResetAPoisonedRecord_notAMintedOne() public {
+        _seal(); _grantMarker();
+        vm.prank(marker);
+        bc.recordRefund("poison", 0, 1, 1);                   // stolen marker: wrong value + full refund
+        bytes32 k = bc.outpointKey(CHAIN, "poison", 0);
+        bc.resetOutpointRecord(k);                            // Safe clears it
+        assertEq(bc.outpointValue(k), 0);
+        assertEq(bc.refundedAmount(k), 0);
+        _mintV("honest", 5e8, "poison", 0, 5e8);              // the real deposit can mint again
+        vm.expectRevert(abi.encodeWithSelector(BridgeControllerV2.OutpointAlreadyProcessed.selector, k));
+        bc.resetOutpointRecord(k);                            // never for a minted output
+        bytes32 other = bc.outpointKey(CHAIN, "other", 0);    // before the prank (external call consumes it)
+        vm.prank(user);
+        vm.expectRevert();
+        bc.resetOutpointRecord(other);                        // admin only
+    }
+
+    function test_valueSetIsLogged() public {
+        _grantMarker();
+        vm.expectEmit(true, false, false, true);
+        emit BridgeControllerV2.OutpointValueSet(bc.outpointKey(CHAIN, "ev", 0), 7e8);
+        vm.prank(marker);
+        bc.recordRefund("ev", 0, 7e8, 1e8);
+    }
 }

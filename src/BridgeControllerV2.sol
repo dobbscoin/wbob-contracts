@@ -135,6 +135,8 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     event MintLimitPerWindowUpdated(uint256 oldLimit, uint256 newLimit);
     event MinWithdrawalUpdated(uint256 oldMin, uint256 newMin);
     event RefundRecorded(bytes32 indexed outpointKey, uint256 value, uint256 refundedTotal);
+    event OutpointValueSet(bytes32 indexed outpointKey, uint256 value);
+    event OutpointRecordReset(bytes32 indexed outpointKey, uint256 oldValue, uint256 oldRefunded);
 
     // ─── Errors ──────────────────────────────────────────────────────────────
 
@@ -157,6 +159,7 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     error WrongSourceChain(uint256 provided, uint256 expected);
     error SourceValueMismatch(bytes32 outpointKey, uint256 provided, uint256 recorded);
     error ExceedsSourceValue(bytes32 outpointKey, uint256 minted, uint256 refunded, uint256 value);
+    error OutpointAlreadyProcessed(bytes32 outpointKey);
 
     // ─── MintAuthorization (identical to V1) ─────────────────────────────────
 
@@ -279,13 +282,29 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
         external
         onlyRole(REFUND_MARKER_ROLE)
     {
+        if (refundedTotal == 0) revert ZeroAmount();
         bytes32 opKey = outpointKey(SOURCE_CHAIN_ID, sourceTxHash, sourceVout);
+        // Imported from V1 (processed, but nothing minted HERE): V2 knows neither
+        // its value nor what V1 minted, so no refund can be accounted against it.
+        if (processedOutpoints[opKey] && mintedAmount[opKey] == 0) revert OutpointAlreadyProcessed(opKey);
         _checkAndSetValue(opKey, value);
         if (refundedTotal <= refundedAmount[opKey]) return;     // already recorded (retry)
         uint256 minted = mintedAmount[opKey];
         if (minted + refundedTotal > value) revert ExceedsSourceValue(opKey, minted, refundedTotal, value);
         refundedAmount[opKey] = refundedTotal;
         emit RefundRecorded(opKey, value, refundedTotal);
+    }
+
+    /**
+     * @notice Admin escape hatch for a wrongly recorded output that never minted:
+     *         clears its recorded value and refund (e.g. a stolen REFUND_MARKER key
+     *         poisoned it). Refuses for anything processed (minted here or imported).
+     */
+    function resetOutpointRecord(bytes32 opKey) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (processedOutpoints[opKey]) revert OutpointAlreadyProcessed(opKey);
+        emit OutpointRecordReset(opKey, outpointValue[opKey], refundedAmount[opKey]);
+        delete outpointValue[opKey];
+        delete refundedAmount[opKey];
     }
 
     // ─── One-time migration import ───────────────────────────────────────────
@@ -410,8 +429,12 @@ contract BridgeControllerV2 is EIP712, AccessControl, Pausable {
     function _checkAndSetValue(bytes32 opKey, uint256 value) internal {
         if (value == 0) revert ZeroAmount();
         uint256 recorded = outpointValue[opKey];
-        if (recorded == 0) outpointValue[opKey] = value;
-        else if (recorded != value) revert SourceValueMismatch(opKey, value, recorded);
+        if (recorded == 0) {
+            outpointValue[opKey] = value;
+            emit OutpointValueSet(opKey, value);
+        } else if (recorded != value) {
+            revert SourceValueMismatch(opKey, value, recorded);
+        }
     }
 
     function _consumeWindow(uint256 amount) internal {
